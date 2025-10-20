@@ -10,16 +10,37 @@ Live OCR demo with smoothing:
 import cv2
 import pytesseract
 import numpy as np
-from collections import deque, Counter
+from collections import deque, Counter, defaultdict
+import json
+import time
+import requests
 
-# telling where tesseract is installed
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR/tesseract.exe"  # path to tesseract executable
 
 # Tesseract config 
 TESSERACT_CONFIG = r'--oem 3 --psm 6'  # oem 3 = default engine(LSTM), psm 6 = block of text
 
 # history of OCR results
 history = deque(maxlen=5)
+
+
+
+# predefined vocabulary (placeholder)
+CARD_VOCAB = {"WIZARD", "DUCK", "HAND", "FIST", "HEALTH", "POINTS"}
+# actions for each card (placeholder)
+CARD_TO_ACTION = {
+    "WIZARD": "cast_spell",
+    "DUCK": "spawn_duck",
+    "HAND": "show_hand",
+    "FIST": "punch",
+    "HEALTH": "heal_player",
+    "POINTS": "add_points",
+}
+
+
+# normalize text for matching
+def _norm(s: str) -> str:
+    return (s or "").strip().upper()
 
 # cleans up each frame for better OCR
 def preprocess_for_ocr(frame):
@@ -62,7 +83,7 @@ def run_ocr(ocr_image):
             conf = float(data['conf'][i])
         except:
             conf = -1 # sometimes conf is missing
-        if conf < 30:  # too weak 
+        if conf < 20:  # too weak 
             continue
         # bounding box
         x, y, w, h = (
@@ -71,8 +92,11 @@ def run_ocr(ocr_image):
             data['width'][i],
             data['height'][i]
         )
-        # tuple
-        results.append((text, conf, (x, y, w, h)))
+
+        if _norm(text) not in CARD_VOCAB:
+            continue
+
+        results.append((_norm(text), conf, (x, y, w, h)))
 
     return results
 
@@ -104,18 +128,98 @@ def draw_smooth(frame, history, min_support = 3):
             )
             # returns display image
     return frame
+    # JSON events
+def stable_events(history, frame_idx, min_support=3):
+    if not history: # needed
+        return []
+    #counter and confidence lists
+    counts = Counter()
+    confs = defaultdict(list)
+    last_bbox = {}
+    # iterate through history
+    for frame_res in history:
+        seen = set() # avoid double counting in same frame
+        for t, c, b in frame_res:
+            if t in seen:
+                continue
+            seen.add(t)
+            counts[t] += 1
+            confs[t].append(c)
+            last_bbox[t] = b
+    events = [] # list of events
+    for t, n in counts.items(): # checking if stable
+        if n >= min_support:
+            x, y, w, h = last_bbox.get(t, (0, 0, 0, 0))
+            avg_conf = float(np.mean(confs[t])) if confs[t] else 0.0
+            events.append({ # structure of event
+                "eventType": "card",
+                "value": t,
+                "confidence": round(avg_conf, 2),
+                "bbox": {"x": int(x), "y": int(y), "w": int(w), "h": int(h)},
+                "countInWindow": int(n)
+            })
+    return events
+
+
+API_BASE = "http://127.0.0.1:8000"  # server
+session = requests.Session()         # reusing TCP connection (faster)
+
+def post_event(event: dict) -> bool:
+    """
+    Send a single OCR event to POST /event.
+    Returns True if the server responded OK, else False (non-fatal).
+    """
+    try:
+        payload = dict(event)          
+        payload["timestamp"] = time.time()  # order
+        resp = session.post(f"{API_BASE}/event", json=payload, timeout=0.5)
+        resp.raise_for_status()       # errors
+        return True
+    except requests.RequestException as e:
+        # crash log
+        print(f"[WARN] POST /event failed: {e}")
+        return False
+
+
+
+def to_game_event(evt: dict) -> dict:
+    """
+    converts a raw OCR 'card' event to a game event
+    keeps backward compatibility (original keys) and adds action and metadata
+    """
+    token = (evt.get("value") or "").strip().upper()
+    action = CARD_TO_ACTION.get(token)  
+
+    return {
+        # OG fields
+        "eventType": evt.get("eventType", "card"),
+        "value": token,
+        "confidence": evt.get("confidence"),
+        "bbox": evt.get("bbox"),
+        "countInWindow": evt.get("countInWindow"),
+
+        # new 
+        "action": action,
+        "source": "ocr-demo",
+        "schemaVersion": 1,
+        "timestamp": time.time(),         # client time
+    }
+
 
 
 def main():
     seen_words = set()  # track words already printed
-    cap = cv2.VideoCapture(0)  # webcam
+    cap = cv2.VideoCapture(1)  # webcam
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)  # set width
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)  # set height
     # needed
     if not cap.isOpened():
         print("ERROR: Could not open camera.")
         return
 
     frame_count = 0 # count frames
-    PROCESS_EVERY_N = 5  # OCR every 5 frames
+    PROCESS_EVERY_N = 8  # OCR every N frames
+    emitted_tokens = set()
 
     while True:
         ret, frame = cap.read() # read frame
@@ -131,17 +235,14 @@ def main():
             results = run_ocr(ocr_img) # OCR
             history.append(results) # add to history
 
-            # prints OCR results for this frame
-            if results:  # only prints if OCR found anything
-                print("OCR Results this frame:")
-                for text, conf, (x, y, w, h) in results:
-                    print(f"{text} (confidence {int(conf)})")
-
-            # recognizes and prints new words
-            for text, conf, (x, y, w, h) in results:
-                if text not in seen_words:
-                    print(f"New word detected: {text} (confidence {int(conf)})")
-                    seen_words.add(text)
+            events = stable_events(history, frame_count, min_support=3)
+            for evt in events:
+                t = evt["value"]
+                if t not in emitted_tokens:
+                    data = to_game_event(evt) # more
+                    print(json.dumps(data))
+                    post_event(data) # post events to backbone
+                    emitted_tokens.add(t)
 
         # draw results from history
         if history:
